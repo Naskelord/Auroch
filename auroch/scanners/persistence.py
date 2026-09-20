@@ -13,7 +13,7 @@ what to check, because a false accusation is worse than a quiet list.
 from __future__ import annotations
 
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Iterable, List, Optional
 
 from ..core import winutil
@@ -26,16 +26,73 @@ if winutil.IS_WINDOWS:
 else:  # pragma: no cover
     winreg = None  # type: ignore
 
-#: Folders any standard user can write to. Code auto-starting from here is the
-#: single strongest cheap signal, because installed software lives elsewhere.
-USER_WRITABLE_MARKERS = (
+#: Candidate locations worth an ACL check. These are NOT conclusions — the
+#: earlier version treated any path under ProgramData as user-writable, which
+#: flagged Microsoft Defender's own platform binaries as a privilege-escalation
+#: risk. ProgramData is a legitimate machine-wide data location whose
+#: subfolders carry whatever ACL their creator set.
+CANDIDATE_MARKERS = (
     "\\appdata\\local\\temp",
     "\\appdata\\roaming",
+    "\\appdata\\local",
     "\\downloads",
     "\\users\\public",
     "\\programdata\\",
     "\\windows\\temp",
+    "\\temp\\",
 )
+
+#: Identities that mean "any ordinary user", in the locales we can anticipate.
+#: A write grant to one of these is what makes a path a privilege-escalation
+#: risk; a grant to a single named user is not.
+NONADMIN_IDENTITIES = (
+    "everyone",
+    "builtin\\users",
+    "nt authority\\authenticated users",
+    "authenticated users",
+    "users",
+)
+
+_ACL_CACHE: dict = {}
+
+
+def _nonadmin_writable(path: Optional[Path]) -> Optional[bool]:
+    """True if ordinary users can write to this path's directory.
+
+    Returns None when it cannot be determined — which, as everywhere else in
+    Auroch, must not be treated as a finding.
+    """
+    if path is None or not winutil.IS_WINDOWS:
+        return None
+    directory = str(path.parent if path.suffix else path)
+    if directory in _ACL_CACHE:
+        return _ACL_CACHE[directory]
+
+    safe = directory.replace("'", "''")
+    acl = winutil.powershell_json(
+        f"(Get-Acl -LiteralPath '{safe}' -ErrorAction SilentlyContinue).Access | "
+        "Select-Object IdentityReference,FileSystemRights,AccessControlType",
+        timeout=45,
+    )
+    if acl is None:
+        _ACL_CACHE[directory] = None
+        return None
+    if isinstance(acl, dict):
+        acl = [acl]
+
+    writable = False
+    for ace in acl:
+        if str(ace.get("AccessControlType", "")).lower() not in ("allow", "0"):
+            continue
+        identity = str(ace.get("IdentityReference", "")).lower()
+        if not any(identity.endswith(i) or identity == i for i in NONADMIN_IDENTITIES):
+            continue
+        rights = str(ace.get("FileSystemRights", "")).lower()
+        if any(r in rights for r in ("fullcontrol", "modify", "write")):
+            writable = True
+            break
+    _ACL_CACHE[directory] = writable
+    return writable
 
 #: Autorun locations beyond the Run keys everyone checks.
 EXTRA_AUTORUN_KEYS = [
@@ -83,11 +140,22 @@ def _read(hive_name: str, subkey: str, value: str) -> Optional[str]:
         return None
 
 
-def _user_writable(path: Optional[Path]) -> bool:
+def _is_candidate(path: Optional[Path]) -> bool:
+    """Cheap pre-filter so the ACL query runs on a handful of paths, not all."""
     if path is None:
         return False
     low = str(path).lower()
-    return any(m in low for m in USER_WRITABLE_MARKERS)
+    return any(m in low for m in CANDIDATE_MARKERS)
+
+
+def _user_writable(path: Optional[Path]) -> bool:
+    """Marker-only test, for autoruns where the *location itself* is the signal.
+
+    Malware auto-starting from Downloads is notable regardless of the ACL.
+    Privilege escalation via a service binary is not — that needs the real
+    permission check above.
+    """
+    return _is_candidate(path)
 
 
 @register
@@ -130,6 +198,32 @@ class PersistenceScanner(Scanner):
         paths = as_list(prefs.get("ExclusionPath"))
         procs = as_list(prefs.get("ExclusionProcess"))
         exts = as_list(prefs.get("ExclusionExtension"))
+
+        # Windows substitutes an explanatory sentence for the real list when the
+        # caller is not elevated. Detect it and report a skipped check.
+        def _is_denied(values) -> bool:
+            return any(str(v).strip().lower().startswith(("n/a:", "n/a "))
+                       for v in values)
+
+        if _is_denied(paths) or _is_denied(procs) or _is_denied(exts):
+            yield Issue(
+                category=self.category,
+                title="Defender exclusions were not checked",
+                detail=(
+                    "Reading the exclusion list requires an elevated process, and "
+                    "Auroch is running as a standard user. Windows returned an "
+                    "explanatory message instead of the list.\n\n"
+                    "This check is skipped rather than passed — an unread list is "
+                    "not an empty one."
+                ),
+                severity=Severity.INFO,
+                fix_kind=FixKind.MANUAL,
+                remediation_hint=(
+                    "Restart Auroch as administrator to audit exclusions. This is "
+                    "the single most valuable check in this section."
+                ),
+            )
+            return
 
         # A broad exclusion is the dangerous kind: it blinds Defender across a
         # whole tree rather than one known-noisy file.
@@ -282,41 +376,55 @@ class PersistenceScanner(Scanner):
     def _winlogon(self, ctx: ScanContext) -> Iterable[Issue]:
         ctx.report("Checking Winlogon and LSA hooks", 0.5)
         wl = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
-        expected = {
-            "shell": "explorer.exe",
-            "userinit": "userinit.exe",
-        }
-        for value, normal in expected.items():
-            actual = _read("HKLM", wl, value.capitalize() if value == "shell" else "Userinit")
+        # Windows stores these as a comma-separated list, and the stock value
+        # carries a trailing comma — "C:\\WINDOWS\\system32\\userinit.exe,".
+        # Parse it as a list instead of string-matching the whole field.
+        for value_name, expected_exe in (("Shell", "explorer.exe"),
+                                         ("Userinit", "userinit.exe")):
+            actual = _read("HKLM", wl, value_name)
             if actual is None:
                 continue
-            cleaned = actual.strip().rstrip(",").strip().lower()
-            if normal not in cleaned:
+
+            components = [c.strip().strip('"') for c in str(actual).split(",")]
+            components = [c for c in components if c]
+            extras = [
+                c for c in components
+                if PureWindowsPath(c).name.lower() != expected_exe
+            ]
+
+            if not components:
+                continue
+            if not extras:
+                continue  # exactly the stock value, however it is spelled
+
+            if all(PureWindowsPath(c).name.lower() != expected_exe
+                   for c in components):
                 yield Issue(
                     category=self.category,
-                    title=f"Winlogon {value} has been modified",
+                    title=f"Winlogon {value_name} has been replaced",
                     detail=(
-                        f"Windows runs this at every logon. It should be "
-                        f"'{normal}'.\n\nActual value: {actual}\n"
-                        f"Key: HKLM\\{wl}\n\n"
-                        "Appending a second program here is a classic persistence "
-                        "technique because it runs before anything the user sees."
+                        f"Windows runs this at every logon and it should be "
+                        f"'{expected_exe}', which is absent entirely.\n\n"
+                        f"Value: {actual}\nKey: HKLM\\{wl}\n\n"
+                        "Replacing this is a classic persistence technique — it runs "
+                        "before anything the user sees."
                     ),
                     severity=Severity.CRITICAL,
                     fix_kind=FixKind.MANUAL,
                     remediation_hint=(
-                        "Do not edit this blindly — a wrong value here prevents logon "
-                        "entirely. Identify the added program first."
+                        "Do not edit this blindly; a wrong value here prevents logon "
+                        "entirely. Identify the program first."
                     ),
                 )
-            elif cleaned not in (normal, normal + ",", f"c:\\windows\\system32\\{normal},"):
+            else:
                 yield Issue(
                     category=self.category,
-                    title=f"Winlogon {value} has extra entries alongside {normal}",
+                    title=f"Winlogon {value_name} has {len(extras)} extra entry(s)",
                     detail=(
-                        f"Value: {actual}\nKey: HKLM\\{wl}\n\n"
-                        "The expected program is present, but something else is "
-                        "chained onto it. Worth identifying."
+                        f"'{expected_exe}' is present as expected, but these are "
+                        f"chained onto it and will also run at every logon:\n\n"
+                        + "\n".join(f"  • {e}" for e in extras)
+                        + f"\n\nFull value: {actual}\nKey: HKLM\\{wl}"
                     ),
                     severity=Severity.HIGH,
                     fix_kind=FixKind.MANUAL,
@@ -418,8 +526,14 @@ class PersistenceScanner(Scanner):
         flagged = []
         for svc in data or []:
             path = _path_from_command(str(svc.get("PathName", "")))
-            if _user_writable(path):
-                flagged.append((svc, path))
+            # Two gates: a cheap location filter, then a real ACL check. Only a
+            # confirmed write grant to ordinary users counts. "Could not read
+            # the ACL" is not evidence of anything.
+            if not _is_candidate(path):
+                continue
+            if _nonadmin_writable(path) is not True:
+                continue
+            flagged.append((svc, path))
         if not flagged:
             return
         rows = "\n".join(
@@ -432,9 +546,9 @@ class PersistenceScanner(Scanner):
             category=self.category,
             title=f"{len(flagged)} service(s) run from user-writable locations",
             detail=(
-                "Services run as SYSTEM. A service binary sitting in a folder that "
-                "ordinary users can write to means any user can potentially replace "
-                "it and gain SYSTEM privileges at the next restart.\n\n" + rows
+                "Services run as SYSTEM. Each folder below was checked with Get-Acl and "
+                "grants write access to ordinary users, so any user could replace the "
+                "binary and gain SYSTEM privileges at the next restart.\n\n" + rows
             ),
             severity=Severity.HIGH,
             fix_kind=FixKind.MANUAL,
