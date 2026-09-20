@@ -127,3 +127,14 @@ Real-time file protection, network/web filtering, and a bundled antivirus
 engine. All three require signed kernel-mode drivers. Python cannot run in
 kernel mode, and a userspace imitation would give the appearance of protection
 without the substance.
+
+## License
+
+MIT — see [LICENSE](LICENSE). You may use, modify and redistribute this
+freely, keeping the copyright notice.
+
+Auroch moves files, deletes registry keys, empties the Recycle Bin and can
+schedule chkdsk. It is provided **as is, with no warranty of any kind**, and
+the author is not liable for data loss or damage arising from its use. Read
+what a fix will do before you tick it; that is why every finding states its
+mechanism.
