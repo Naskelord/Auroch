@@ -42,6 +42,12 @@ class Severity(IntEnum):
 
 
 class Category:
+    NETWORK = "Network & Attack Surface"
+    FIREWALL = "Firewall"
+    PERSISTENCE = "Persistence & Tampering"
+    ACCOUNTS = "Accounts & Access"
+    HARDENING = "Windows Hardening"
+    VPN = "VPN & DNS"
     JUNK = "Junk & Temporary Files"
     REGISTRY = "Registry Hygiene"
     PRIVACY = "Privacy Traces"
@@ -53,9 +59,17 @@ class Category:
     PERFORMANCE = "Performance"
     HARDWARE = "Hardware Inventory"
 
+    #: Display order. Anything that means "you may already be compromised"
+    #: sorts above anything that means "your machine is untidy".
     ORDER = [
         SYSTEM_FILES,
         SECURITY,
+        PERSISTENCE,
+        ACCOUNTS,
+        NETWORK,
+        FIREWALL,
+        VPN,
+        HARDENING,
         STABILITY,
         DISK,
         STARTUP,

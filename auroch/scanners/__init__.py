@@ -5,6 +5,9 @@ ones first: the user sees results from those while the cheap ones finish.
 """
 from . import systemfiles  # noqa: F401
 from . import security     # noqa: F401
+from . import persistence  # noqa: F401
+from . import network      # noqa: F401
+from . import firewall     # noqa: F401
 from . import stability    # noqa: F401
 from . import disk         # noqa: F401
 from . import startup      # noqa: F401
@@ -17,6 +20,9 @@ from . import hardware     # noqa: F401
 __all__ = [
     "systemfiles",
     "security",
+    "persistence",
+    "network",
+    "firewall",
     "stability",
     "disk",
     "startup",
