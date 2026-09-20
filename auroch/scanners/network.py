@@ -48,16 +48,90 @@ NOTABLE_PORTS: Dict[int, tuple] = {
 }
 
 
-def _is_wildcard(addr: str) -> bool:
-    """True when the socket is bound to every interface, not just loopback."""
-    if not addr:
-        return False
-    if addr in ("0.0.0.0", "::", "*"):
-        return True
+#: Adapter descriptions that mean "this is a virtual switch, not your LAN".
+VIRTUAL_ADAPTER_MARKERS = (
+    "hyper-v", "vethernet", "wsl", "docker", "virtualbox", "vmware",
+    "tap-", "tunnel", "loopback", "npcap", "bluetooth",
+)
+
+#: Get-SmbShareAccess returns enums; over JSON they arrive as integers.
+SMB_ACCESS_RIGHT = {0: "Full Control", 1: "Change", 2: "Read", 3: "Custom"}
+SMB_ACL_TYPE = {0: "Allow", 1: "Deny"}
+
+
+def _smb_right(value) -> str:
     try:
-        return not ipaddress.ip_address(addr.strip("[]")).is_loopback
+        return SMB_ACCESS_RIGHT.get(int(value), str(value))
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _smb_type(value) -> str:
+    try:
+        return SMB_ACL_TYPE.get(int(value), str(value))
+    except (TypeError, ValueError):
+        return str(value)
+
+
+WILDCARD = "wildcard"   # 0.0.0.0 or :: — every interface, present and future
+LOOPBACK = "loopback"   # 127.0.0.1 / ::1 — this machine only
+VIRTUAL = "virtual"     # one virtual adapter (Docker, WSL, Hyper-V)
+REAL = "real"           # one genuine network interface
+
+
+def _bind_kind(addr: str, adapters: Dict[str, tuple]) -> str:
+    """Classify what a listening socket is actually reachable from.
+
+    The earlier version answered a yes/no question — "is this loopback?" — and
+    so titled a socket bound to one Docker adapter as "listening on all
+    interfaces". Binding to 172.19.176.1 exposes you to containers on that
+    switch; binding to 0.0.0.0 exposes you to the network. Those are not the
+    same finding and must not carry the same severity.
+    """
+    if not addr:
+        return LOOPBACK
+    if addr in ("0.0.0.0", "::", "*"):
+        return WILDCARD
+    clean = addr.strip("[]").split("%")[0]
+    try:
+        if ipaddress.ip_address(clean).is_loopback:
+            return LOOPBACK
     except ValueError:
-        return False
+        return LOOPBACK
+    alias, description = adapters.get(clean, ("", ""))
+    haystack = f"{alias} {description}".lower()
+    if any(m in haystack for m in VIRTUAL_ADAPTER_MARKERS):
+        return VIRTUAL
+    return REAL
+
+
+def _adapter_map() -> Dict[str, tuple]:
+    """{ip address: (interface alias, adapter description)}."""
+    out: Dict[str, tuple] = {}
+    addrs = winutil.powershell_json(
+        "Get-NetIPAddress -ErrorAction SilentlyContinue | "
+        "Select-Object IPAddress,InterfaceAlias", timeout=60)
+    if isinstance(addrs, dict):
+        addrs = [addrs]
+    descriptions: Dict[str, str] = {}
+    nics = winutil.powershell_json(
+        "Get-NetAdapter -ErrorAction SilentlyContinue | "
+        "Select-Object Name,InterfaceDescription", timeout=60)
+    if isinstance(nics, dict):
+        nics = [nics]
+    for nic in nics or []:
+        descriptions[str(nic.get("Name", ""))] = str(nic.get("InterfaceDescription", ""))
+    for entry in addrs or []:
+        ip = str(entry.get("IPAddress", "")).split("%")[0]
+        alias = str(entry.get("InterfaceAlias", ""))
+        if ip:
+            out[ip] = (alias, descriptions.get(alias, ""))
+    return out
+
+
+def _soften(severity: Severity, steps: int = 2) -> Severity:
+    """Lower a severity without dropping below Info."""
+    return Severity(max(int(Severity.INFO), int(severity) - steps))
 
 
 @register
@@ -120,77 +194,138 @@ class AttackSurfaceScanner(Scanner):
         if psutil is None:
             return
 
-        exposed: List[tuple] = []
-        loopback_only = 0
+        adapters = _adapter_map()
         try:
             connections = psutil.net_connections(kind="inet")
         except Exception:
             return
+
+        # A service bound to both 0.0.0.0 and :: is one service with two
+        # sockets. Keying by (port, pid) collapses the IPv4/IPv6 pair; without
+        # this the reported count is roughly double the truth.
+        seen: Dict[tuple, dict] = {}
+        loopback_only: set = set()
 
         for conn in connections:
             if conn.status != psutil.CONN_LISTEN or not conn.laddr:
                 continue
             addr = conn.laddr.ip
             port = conn.laddr.port
-            if not _is_wildcard(addr):
-                loopback_only += 1
+            kind = _bind_kind(addr, adapters)
+            if kind == LOOPBACK:
+                loopback_only.add((port, conn.pid))
                 continue
+
+            key = (port, conn.pid)
             name, exe = self._process_of(conn.pid)
-            exposed.append((port, addr, name, exe, conn.pid))
+            existing = seen.get(key)
+            if existing is None:
+                seen[key] = {"port": port, "pid": conn.pid, "name": name,
+                             "exe": exe, "kind": kind, "addrs": {addr}}
+            else:
+                existing["addrs"].add(addr)
+                # Widest exposure wins: a service on both a virtual adapter and
+                # 0.0.0.0 is reportable at the 0.0.0.0 level.
+                order = {VIRTUAL: 0, REAL: 1, WILDCARD: 2}
+                if order[kind] > order[existing["kind"]]:
+                    existing["kind"] = kind
 
-        # Named, known-risky services first — one finding each, because the
-        # remediation differs per service.
-        seen_ports = set()
-        for port, addr, name, exe, pid in sorted(exposed):
-            if port in NOTABLE_PORTS and port not in seen_ports:
-                seen_ports.add(port)
-                label, severity, why = NOTABLE_PORTS[port]
-                yield Issue(
-                    category=self.category,
-                    title=f"{label} is listening on all interfaces (port {port})",
-                    detail=(
-                        f"{why}\n\n"
-                        f"Bound to: {addr}:{port}\n"
-                        f"Process:  {name} (PID {pid})\n"
-                        f"Path:     {exe or 'unknown'}\n\n"
-                        "Bound to all interfaces means anything that can route to this "
-                        "machine can attempt to connect. Your firewall may still be "
-                        "blocking it — check the Firewall section alongside this."
-                    ),
-                    severity=severity,
-                    fix_kind=FixKind.MANUAL,
-                    remediation_hint=(
-                        "If you do not need it, stop the service. If you do, restrict "
-                        "it with a firewall rule scoped to specific addresses."
-                    ),
-                )
+        entries = list(seen.values())
+        named: set = set()
 
-        others = [e for e in exposed if e[0] not in NOTABLE_PORTS]
-        if others:
-            rows = "\n".join(
-                f"  • {port:<6} {name or '?'}  (PID {pid})  {exe or ''}".rstrip()
-                for port, addr, name, exe, pid in sorted(others)[:40]
-            )
-            more = f"\n  … and {len(others) - 40} more" if len(others) > 40 else ""
+        for entry in sorted(entries, key=lambda e: e["port"]):
+            port = entry["port"]
+            if port not in NOTABLE_PORTS or port in named:
+                continue
+            named.add(port)
+            label, severity, why = NOTABLE_PORTS[port]
+            kind = entry["kind"]
+            bound = ", ".join(sorted(entry["addrs"]))
+
+            if kind == WILDCARD:
+                where = "on all interfaces"
+                reach = ("Bound to all interfaces means anything that can route to "
+                         "this machine can attempt to connect. Your firewall may "
+                         "still be blocking it — check the Firewall section too.")
+            elif kind == VIRTUAL:
+                alias = adapters.get(sorted(entry["addrs"])[0], ("", ""))[0]
+                where = f"on a virtual adapter ({alias or 'virtual switch'})"
+                severity = _soften(severity)
+                reach = ("This is the host side of an internal virtual switch — "
+                         "Docker, WSL or Hyper-V. Reachable by containers and VMs "
+                         "on that switch, not by your physical network. Lowered in "
+                         "severity for that reason.")
+            else:
+                alias = adapters.get(sorted(entry["addrs"])[0], ("", ""))[0]
+                where = f"on {alias or 'a network interface'}"
+                reach = ("Bound to a real network interface, so other machines on "
+                         "that network can attempt to connect.")
+
             yield Issue(
                 category=self.category,
-                title=f"{len(others)} other port(s) listening on all interfaces",
+                title=f"{label} is listening {where} (port {port})",
+                detail=(
+                    f"{why}\n\n"
+                    f"Bound to: {bound}:{port}\n"
+                    f"Process:  {entry['name'] or '?'} (PID {entry['pid']})\n"
+                    f"Path:     {entry['exe'] or 'unknown'}\n\n{reach}"
+                ),
+                severity=severity,
+                fix_kind=FixKind.MANUAL,
+                remediation_hint=(
+                    "If you do not need it, stop the service. If you do, restrict "
+                    "it with a firewall rule scoped to specific addresses."
+                ),
+            )
+
+        others = [e for e in entries if e["port"] not in NOTABLE_PORTS]
+        wildcard_others = [e for e in others if e["kind"] == WILDCARD]
+        real_others = [e for e in others if e["kind"] == REAL]
+        virtual_others = [e for e in others if e["kind"] == VIRTUAL]
+
+        def rows(items):
+            return "\n".join(
+                f"  • {e['port']:<6} {e['name'] or '?'}  (PID {e['pid']})"
+                + (f"\n      {e['exe']}" if e["exe"] else "")
+                for e in sorted(items, key=lambda x: x["port"])[:40]
+            )
+
+        exposed = wildcard_others + real_others
+        if exposed:
+            yield Issue(
+                category=self.category,
+                title=f"{len(exposed)} other port(s) reachable from the network",
                 detail=(
                     "Not known-dangerous services, but each is a door. Anything you "
-                    "do not recognise is worth identifying.\n\n" + rows + more
+                    "do not recognise is worth identifying. Sockets bound to both "
+                    "IPv4 and IPv6 are counted once.\n\n" + rows(exposed)
+                    + (f"\n  … and {len(exposed) - 40} more" if len(exposed) > 40 else "")
                 ),
-                severity=Severity.LOW if len(others) < 10 else Severity.MEDIUM,
+                severity=Severity.LOW if len(exposed) < 10 else Severity.MEDIUM,
                 fix_kind=FixKind.MANUAL,
+            )
+
+        if virtual_others:
+            yield Issue(
+                category=self.category,
+                title=f"{len(virtual_others)} port(s) listening on virtual adapters only",
+                detail=(
+                    "Bound to Docker, WSL or Hyper-V virtual switches rather than "
+                    "your physical network. Reachable by containers and VMs on those "
+                    "switches, not from the LAN.\n\n" + rows(virtual_others)
+                ),
+                severity=Severity.INFO,
             )
 
         if loopback_only:
             yield Issue(
                 category=self.category,
-                title=f"{loopback_only} service(s) listening on loopback only",
+                title=f"{len(loopback_only)} service(s) listening on loopback only",
                 detail=(
-                    "Bound to 127.0.0.1, so they are reachable only from this machine. "
-                    "This is the correct way to run local development servers and "
-                    "databases — listed for completeness, not as a problem."
+                    "Bound to 127.0.0.1 or ::1, so they are reachable only from this "
+                    "machine. This is the correct way to run local development "
+                    "servers and databases — listed for completeness, not as a "
+                    "problem."
                 ),
                 severity=Severity.INFO,
             )
@@ -244,18 +379,31 @@ class AttackSurfaceScanner(Scanner):
                 and str(a.get("AccessControlType", "")).lower() in ("allow", "0")
             ]
             rows = "\n".join(
-                f"  • {a.get('AccountName')}: {a.get('AccessRight')} ({a.get('AccessControlType')})"
+                f"  • {a.get('AccountName')}: {_smb_right(a.get('AccessRight'))}"
+                f" ({_smb_type(a.get('AccessControlType'))})"
+                for a in (access or [])
+            )
+            full_control = any(
+                str(a.get("AccountName", "")).lower().endswith("everyone")
+                and _smb_right(a.get("AccessRight")) == "Full Control"
+                and _smb_type(a.get("AccessControlType")) == "Allow"
                 for a in (access or [])
             )
             yield Issue(
                 category=self.category,
                 title=(
+                    f"File share '{name}' gives Everyone full control"
+                    if full_control else
                     f"File share '{name}' is open to Everyone"
                     if everyone else f"File share '{name}' is published"
                 ),
                 detail=(
                     f"Path: {path}\n\nPermissions:\n{rows or '  (could not read)'}\n\n"
                     + (
+                        "Full Control for Everyone means any account that can reach "
+                        "this machine over SMB can read, modify and DELETE these "
+                        "files — not merely read them."
+                        if full_control else
                         "'Everyone' means any account that can reach this machine over "
                         "SMB, including anonymous access in some configurations."
                         if everyone else
@@ -263,11 +411,14 @@ class AttackSurfaceScanner(Scanner):
                         "the network."
                     )
                 ),
-                severity=Severity.HIGH if everyone else Severity.MEDIUM,
+                severity=(Severity.CRITICAL if full_control
+                          else Severity.HIGH if everyone else Severity.MEDIUM),
                 fix_kind=FixKind.MANUAL,
                 remediation_hint=(
                     "Remove the share if it is not in use, or replace Everyone with "
-                    "specific accounts."
+                    "specific accounts:\n"
+                    f"  Revoke-SmbShareAccess -Name '{name}' -AccountName Everyone -Force\n"
+                    f"  Remove-SmbShare -Name '{name}'"
                 ),
             )
 
