@@ -78,6 +78,9 @@ LOOPBACK = "loopback"   # 127.0.0.1 / ::1 — this machine only
 VIRTUAL = "virtual"     # one virtual adapter (Docker, WSL, Hyper-V)
 REAL = "real"           # one genuine network interface
 
+#: How much of the world each bind kind exposes you to.
+_EXPOSURE_ORDER = {LOOPBACK: -1, VIRTUAL: 0, REAL: 1, WILDCARD: 2}
+
 
 def _bind_kind(addr: str, adapters: Dict[str, tuple]) -> str:
     """Classify what a listening socket is actually reachable from.
@@ -221,14 +224,17 @@ class AttackSurfaceScanner(Scanner):
             existing = seen.get(key)
             if existing is None:
                 seen[key] = {"port": port, "pid": conn.pid, "name": name,
-                             "exe": exe, "kind": kind, "addrs": {addr}}
+                             "exe": exe, "kind": kind, "addrs": {addr},
+                             "widest_addr": addr}
             else:
                 existing["addrs"].add(addr)
                 # Widest exposure wins: a service on both a virtual adapter and
-                # 0.0.0.0 is reportable at the 0.0.0.0 level.
-                order = {VIRTUAL: 0, REAL: 1, WILDCARD: 2}
-                if order[kind] > order[existing["kind"]]:
+                # a real one is reportable at the real one's level — and must be
+                # described by THAT adapter, not by whichever address happens to
+                # sort first.
+                if _EXPOSURE_ORDER[kind] > _EXPOSURE_ORDER[existing["kind"]]:
                     existing["kind"] = kind
+                    existing["widest_addr"] = addr
 
         entries = list(seen.values())
         named: set = set()
@@ -248,7 +254,7 @@ class AttackSurfaceScanner(Scanner):
                          "this machine can attempt to connect. Your firewall may "
                          "still be blocking it — check the Firewall section too.")
             elif kind == VIRTUAL:
-                alias = adapters.get(sorted(entry["addrs"])[0], ("", ""))[0]
+                alias = adapters.get(entry["widest_addr"], ("", ""))[0]
                 where = f"on a virtual adapter ({alias or 'virtual switch'})"
                 severity = _soften(severity)
                 reach = ("This is the host side of an internal virtual switch — "
@@ -256,7 +262,7 @@ class AttackSurfaceScanner(Scanner):
                          "on that switch, not by your physical network. Lowered in "
                          "severity for that reason.")
             else:
-                alias = adapters.get(sorted(entry["addrs"])[0], ("", ""))[0]
+                alias = adapters.get(entry["widest_addr"], ("", ""))[0]
                 where = f"on {alias or 'a network interface'}"
                 reach = ("Bound to a real network interface, so other machines on "
                          "that network can attempt to connect.")
@@ -267,6 +273,7 @@ class AttackSurfaceScanner(Scanner):
                 detail=(
                     f"{why}\n\n"
                     f"Bound to: {bound}:{port}\n"
+                    f"Rated on: {entry['widest_addr']} ({kind})\n"
                     f"Process:  {entry['name'] or '?'} (PID {entry['pid']})\n"
                     f"Path:     {entry['exe'] or 'unknown'}\n\n{reach}"
                 ),
