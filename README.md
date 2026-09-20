@@ -1,16 +1,29 @@
 # Auroch
 
-A PC health, repair and maintenance tool for Windows. Built in Python as a
-personal-use alternative to commercial "PC optimizer" suites.
+A PC health, repair and security auditing tool for Windows. Built in Python as
+a personal-use alternative to commercial "PC optimizer" suites.
 
 ## What it does
 
-Ten scanners, run in order of how much they matter:
+Thirteen scanners, run in order of how much they matter.
+
+### Security
 
 | Scanner | Checks |
 |---|---|
 | Windows system files | `SFC /verifyonly` and `DISM /CheckHealth`, plus pending-reboot state |
 | Security posture | Defender real-time protection, definition age, unresolved threats, firewall profiles, UAC, hosts-file tampering, multiple AV products |
+| Persistence & tampering | Defender exclusion auditing, Tamper Protection, secondary autorun keys, Winlogon `Shell`/`Userinit`, Image File Execution Options debugger hijacks, WMI event consumers, services in user-writable folders |
+| Accounts & access | *(planned)* local admins, guest account, password policy, RDP config, BitLocker |
+| Network & attack surface | Listening sockets classified by bind address, named risky services with their owning process, SMB shares, SMBv1 and signing, RDP with NLA state, network profile |
+| Firewall | Inbound rules accepting any remote address on Public, rules pointing at missing programs, default inbound action, drop logging |
+| VPN & DNS | *(planned)* DNS leak detection, kill-switch audit, adapter state |
+| Windows hardening | *(planned)* ASR rules, Controlled Folder Access, macro policy, PowerShell logging, SmartScreen |
+
+### Health
+
+| Scanner | Checks |
+|---|---|
 | Crashes & stability | BSOD minidumps, bugcheck events grouped by stop code, repeatedly-crashing apps, Kernel-Power 41 events, disk/NTFS errors |
 | Disk health | Free space per volume, `Get-PhysicalDisk` health, SMART predictive-failure, NTFS dirty bit |
 | Startup & autoruns | Run keys, startup folders, scheduled tasks — with Authenticode checks on anything launching from a temp or Downloads path |
@@ -22,43 +35,62 @@ Ten scanners, run in order of how much they matter:
 
 ## Design decisions worth knowing about
 
-**Two of the three fix tiers are reversible; the third is not, and says so.**
+### Unknown is not a finding
+
+This is the rule the whole tool is built on, and nearly every bug found during
+development was a violation of it. `Path.exists()` returns `False` for "access
+denied" as readily as for "not there". `Get-MpPreference` returns an
+explanatory sentence instead of the exclusion list when unelevated. An
+unreadable ACL is not a permissive one.
+
+So paths resolve to **present / absent / unknown**, and only a genuine
+`FileNotFoundError` counts as proof of absence. A check that could not run is
+reported as *skipped*, never as passed. A permission a scanner could not read
+produces no finding at all.
+
+### Three fix tiers, two of them reversible — and it says which
 
 | Tier | Mechanism | Reversible |
 |---|---|---|
 | File deletion | Moved to `%LOCALAPPDATA%\Auroch\backups\<timestamp>\` with a JSON manifest | Yes — `Tools > Undo` |
 | Registry deletion | Key exported to `.reg` first; the delete is **refused** if the export fails | Yes — `Tools > Undo` |
-| Command | Runs a Windows tool (SFC, DISM, chkdsk, Defender, powercfg, `reg add`) | **No** |
+| Command | Runs a Windows tool (SFC, DISM, chkdsk, Defender, `reg add`) | **No** |
 
-The confirmation dialog splits the selection into these groups by name and
-switches to a warning icon whenever anything irreversible is ticked. Tier 3
-covers emptying the Recycle Bin, `Remove-MpThreat`, and scheduling chkdsk.
+The confirmation dialog splits your selection into these groups by name and
+switches to a warning icon whenever anything irreversible is ticked.
 
-**Quarantine does not free disk space, and the UI does not pretend otherwise.**
-Quarantined files sit on the same volume they came from, so ticking 3 GB of
-temp files reclaims nothing until you run `Tools > Empty quarantine`. The
-footer reads `3.1 GB → quarantine`, never "frees 3.1 GB", and bytes headed for
+Firewall rules are the exception that proves the rule: Auroch will not delete
+one automatically, because unlike a registry key a firewall rule cannot be
+exported and restored, so it could not honour the undo guarantee.
+
+### Quarantine does not free disk space, and the UI does not pretend otherwise
+
+Quarantined files sit on the same volume they came from. Ticking 3 GB of temp
+files reclaims nothing until you run `Tools > Empty quarantine`. The footer
+reads `3.1 GB → quarantine`, never "frees 3.1 GB", and bytes headed for
 permanent deletion are counted separately from bytes headed for quarantine.
-Emptying the quarantine offers *delete all but the newest* as the default, so
-one undo always survives.
 
-**Nothing runs unless you tick it.** The scan is read-only. The Fix button is
-disabled until you select something, and it shows a confirmation listing every
-item before it acts.
+### The health score cannot be gamed by junk
 
-**The health score cannot be gamed by junk.** Minor findings accumulate with
-diminishing returns and are capped at 22 points total, so no quantity of temp
-files can make a healthy machine score below 78. Important and Critical
-findings accumulate linearly and hit hard. This is deliberate: inflating the
-issue count with harmless registry orphans is the central dishonesty of the
-commercial tools this replaces.
+Minor findings accumulate with diminishing returns and are **capped at 22
+points total**, so no quantity of temp files can push a healthy machine below
+78. Important and Critical findings accumulate linearly and hit hard — one
+drive predicting its own failure drops you to 40.
 
-**It wraps Microsoft's tools rather than replacing them.** Malware scanning
-drives Defender via PowerShell; system-file repair drives SFC and DISM against
-Microsoft's own sources. There is no bundled AV engine and no kernel driver,
-because doing either properly needs a licensed signature feed, an EV
-code-signing certificate and Microsoft attestation signing — and doing either
-badly is worse than not doing it.
+Inflating an issue count with harmless registry orphans is the central
+dishonesty of the tools this replaces.
+
+### Findings state what is unusual, not what is malicious
+
+A WMI event consumer or a service in ProgramData is described with what makes
+it notable and what to check. Never "this is malware". For a tool you are meant
+to trust, a false accusation is worse than a quiet list.
+
+### It wraps Microsoft's tools rather than replacing them
+
+Malware scanning drives Defender via PowerShell; system-file repair drives SFC
+and DISM against Microsoft's own sources. There is no bundled AV engine and no
+kernel driver.
 
 ## Running it
 
@@ -67,10 +99,10 @@ pip install -r requirements.txt
 python main.py
 ```
 
-Several checks need elevation. Either use `run_as_admin.bat`, or click
-*Restart as administrator* on the home screen. Without it, the system-file and
-component-store checks are **skipped and reported as skipped** — never silently
-passed.
+Several checks need elevation — Defender exclusion auditing above all. Use
+`run_as_admin.bat`, or click *Restart as administrator* on the home screen.
+Without it those checks are **skipped and reported as skipped**, never
+silently passed.
 
 Command line, for a scheduled task:
 
@@ -85,11 +117,11 @@ python main.py --cli --deep   # adds DISM /ScanHealth and a Windows Update query
 main.py                  entry point (GUI / --cli / --elevate)
 auroch/
   core/
-    issue.py             Issue, Severity, FixKind, formatting
+    issue.py             Issue, Severity, FixKind, Category ordering
     scanner.py           Scanner base class + registry
     engine.py            orchestration, ScanReport, health scoring
     actions.py           the repair executor
-    backup.py            quarantine, .reg export, restore points, undo
+    backup.py            quarantine, .reg export, restore points, undo, purge
     report.py            self-contained HTML export
     winutil.py           elevation, PowerShell/subprocess, filesystem walking
   scanners/              one module per scanner; @register adds it to the run
@@ -98,6 +130,8 @@ auroch/
     widgets.py           ScoreRing, PulseRing
     workers.py           QThread wrappers (the GUI thread never blocks)
     main_window.py       the four pages
+tools/
+  diagnose_uninstall.py  read-only ground-truth dump for the registry scanner
 ```
 
 ## Adding a scanner
@@ -115,7 +149,7 @@ class MyScanner(Scanner):
 
     def scan(self, ctx: ScanContext):
         ctx.report("Looking at something", 0.5)
-        if something_is_wrong:
+        if definitely_wrong:          # not "could not verify"
             yield Issue(self.category, "Title", "Detail", Severity.MEDIUM)
 ```
 
@@ -124,9 +158,10 @@ Then import it in `auroch/scanners/__init__.py`. Import order is run order.
 ## Deliberate non-goals
 
 Real-time file protection, network/web filtering, and a bundled antivirus
-engine. All three require signed kernel-mode drivers. Python cannot run in
+engine. All three require signed kernel-mode drivers; Python cannot run in
 kernel mode, and a userspace imitation would give the appearance of protection
-without the substance.
+without the substance. Defender already does this properly at the kernel level
+— Auroch audits its configuration instead, which is the part nobody checks.
 
 ## License
 
