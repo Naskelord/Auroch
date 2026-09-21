@@ -159,16 +159,33 @@ class StartupScanner(Scanner):
 
     def _scheduled_tasks(self, ctx: ScanContext) -> Iterable[Issue]:
         ctx.report("Checking scheduled tasks", 0.95)
+        # Filtering on TaskPath alone is not enough. Windows 11's Content
+        # Delivery Manager registers SoftLandingCreativeManagementTask under
+        # \SoftLanding\, outside the \Microsoft\ namespace entirely, so a
+        # path-only filter reports a Microsoft-signed component as third-party.
+        # Read the Author too and exclude anything Microsoft-authored.
         data = winutil.powershell_json(
             "Get-ScheduledTask | Where-Object {$_.State -ne 'Disabled' -and "
             "$_.TaskPath -notlike '\\Microsoft\\*'} | "
-            "Select-Object TaskName,TaskPath",
+            "Select-Object TaskName,TaskPath,Author",
             timeout=90,
         )
         if not data:
             return
         if isinstance(data, dict):
             data = [data]
+
+        def microsoft_authored(task) -> bool:
+            author = str(task.get("Author", "") or "").lower()
+            # Authors appear either as a plain name or as an ms-resource
+            # indirection string like "$(@%SystemRoot%\\system32\\...,-100)".
+            return ("microsoft" in author
+                    or author.startswith("$(@%systemroot%")
+                    or author.startswith("$(@%windir%"))
+
+        data = [d for d in data if not microsoft_authored(d)]
+        if not data:
+            return
         names = [f"{d.get('TaskPath','')}{d.get('TaskName','')}" for d in data]
         if len(names) >= 8:
             listing = "\n".join(f"  • {n}" for n in sorted(names)[:40])
