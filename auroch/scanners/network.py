@@ -78,6 +78,40 @@ LOOPBACK = "loopback"   # 127.0.0.1 / ::1 — this machine only
 VIRTUAL = "virtual"     # one virtual adapter (Docker, WSL, Hyper-V)
 REAL = "real"           # one genuine network interface
 
+#: 135/139/445 are one decision — "File and Printer Sharing is on" — not
+#: three independent problems. Reporting them separately triples the penalty
+#: for a single setting.
+WINDOWS_NETWORKING_PORTS = {135, 139, 445}
+
+PUBLIC = "public"
+PRIVATE = "private"
+UNKNOWN_PROFILE = "unknown"
+
+
+def _network_exposure() -> str:
+    """The most exposed profile among active connections.
+
+    Windows rates a network Public (untrusted) or Private/DomainAuthenticated
+    (trusted). The same listening port means very different things on each, so
+    severity has to know which you are on.
+    """
+    data = winutil.powershell_json(
+        "Get-NetConnectionProfile | Select-Object Name,NetworkCategory",
+        timeout=60)
+    if isinstance(data, dict):
+        data = [data]
+    if not data:
+        return UNKNOWN_PROFILE
+    worst = None
+    for profile in data:
+        category = str(profile.get("NetworkCategory", "")).lower()
+        if category in ("public", "0"):
+            return PUBLIC
+        if category in ("private", "1", "domainauthenticated", "2"):
+            worst = PRIVATE
+    return worst or UNKNOWN_PROFILE
+
+
 #: How much of the world each bind kind exposes you to.
 _EXPOSURE_ORDER = {LOOPBACK: -1, VIRTUAL: 0, REAL: 1, WILDCARD: 2}
 
@@ -198,6 +232,7 @@ class AttackSurfaceScanner(Scanner):
             return
 
         adapters = _adapter_map()
+        exposure = _network_exposure()
         try:
             connections = psutil.net_connections(kind="inet")
         except Exception:
@@ -239,12 +274,77 @@ class AttackSurfaceScanner(Scanner):
         entries = list(seen.values())
         named: set = set()
 
+        # File and Printer Sharing binds 135, 139 and 445 together. They are
+        # one setting, so they get one finding — otherwise a single toggle
+        # costs three Important ratings and drags the score down by 51 points
+        # on a machine doing nothing unusual.
+        sharing = [e for e in entries
+                   if e["port"] in WINDOWS_NETWORKING_PORTS
+                   and e["kind"] in (WILDCARD, REAL)]
+        if sharing:
+            ports = sorted({e["port"] for e in sharing})
+            widest = max(sharing, key=lambda e: _EXPOSURE_ORDER[e["kind"]])
+            alias = adapters.get(widest["widest_addr"], ("", ""))[0]
+            if exposure == PUBLIC:
+                severity = Severity.HIGH
+                verdict = (
+                    "You are on a network Windows classifies as PUBLIC, which "
+                    "means untrusted. File and Printer Sharing should not be "
+                    "reachable there — this is the configuration that gets "
+                    "machines compromised on cafe and hotel wifi."
+                )
+            elif exposure == PRIVATE:
+                severity = Severity.LOW
+                verdict = (
+                    "Your active network is classified Private, so this is the "
+                    "expected Windows default rather than a misconfiguration. "
+                    "It is listed because it is real exposure — anyone who gets "
+                    "onto your network can reach it — not because it is wrong."
+                )
+            else:
+                severity = Severity.MEDIUM
+                verdict = (
+                    "The network profile could not be determined, so this is "
+                    "rated in the middle. On a trusted home network it is "
+                    "normal; on an untrusted one it is not."
+                )
+            yield Issue(
+                category=self.category,
+                title=(
+                    "Windows File and Printer Sharing is reachable on "
+                    f"{alias or 'the network'} (ports "
+                    + ", ".join(str(x) for x in ports) + ")"
+                ),
+                detail=(
+                    "RPC (135), NetBIOS (139) and SMB (445) are bound together "
+                    "whenever File and Printer Sharing is enabled. They are one "
+                    "setting, reported once.\n\n"
+                    f"Network profile: {exposure}\n"
+                    f"Rated on: {widest['widest_addr']} ({widest['kind']})\n\n"
+                    + verdict
+                ),
+                severity=severity,
+                fix_kind=FixKind.MANUAL,
+                remediation_hint=(
+                    "Turn it off with:  Set-NetFirewallRule -DisplayGroup "
+                    "'File and Printer Sharing' -Enabled False\n"
+                    "Or set the network to Public, which does the same thing "
+                    "via the firewall while keeping sharing available at home."
+                ),
+            )
+            named.update(WINDOWS_NETWORKING_PORTS)
+
         for entry in sorted(entries, key=lambda e: e["port"]):
             port = entry["port"]
             if port not in NOTABLE_PORTS or port in named:
                 continue
             named.add(port)
             label, severity, why = NOTABLE_PORTS[port]
+            # A trusted network lowers the stakes for everything, not just
+            # Windows sharing. An exposed database on your own LAN is worth
+            # knowing about; it is not the same as one facing a hotel network.
+            if exposure == PRIVATE:
+                severity = _soften(severity, 1)
             kind = entry["kind"]
             bound = ", ".join(sorted(entry["addrs"]))
 
