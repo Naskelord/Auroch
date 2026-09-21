@@ -140,6 +140,18 @@ def _path_state(path: Optional[Path]) -> str:
     """
     if path is None or str(path).strip() in ("", "."):
         return UNKNOWN
+
+    # A bare name with no directory component is resolved by the shell through
+    # PATH, not as a literal file. "cmd.exe" exists; it simply is not a path.
+    text = str(path)
+    if "\\" not in text and "/" not in text:
+        import shutil
+        if shutil.which(text):
+            return PRESENT
+        # PATH at logon may differ from PATH now, so absence here proves
+        # nothing.
+        return UNKNOWN
+
     try:
         path.stat()
         return PRESENT

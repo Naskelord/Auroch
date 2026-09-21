@@ -13,6 +13,7 @@ what to check, because a false accusation is worse than a quiet list.
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path, PureWindowsPath
 from typing import Iterable, List, Optional
 
@@ -54,6 +55,36 @@ NONADMIN_IDENTITIES = (
 )
 
 _ACL_CACHE: dict = {}
+
+#: Launch patterns that no legitimate installer uses for an autorun. Each is a
+#: way of running something without naming a program the user would recognise.
+SUSPICIOUS_COMMAND_PATTERNS = [
+    (re.compile(r"\b(?:https?://|www\.)", re.I),
+     "opens a web address at logon"),
+    (re.compile(r"\bstart\s+[\w.-]+\.(?:click|xyz|top|live|shop|icu|buzz|cfd|link)\b", re.I),
+     "opens a throwaway ad-domain at logon"),
+    (re.compile(r"\bmshta\b", re.I),
+     "uses mshta, which executes remote script content"),
+    (re.compile(r"\brundll32\b.*\b(?:javascript|url\.dll)", re.I),
+     "uses rundll32 to run script or open a URL"),
+    (re.compile(r"powershell.*\s-(?:enc|encodedcommand|e)\b", re.I),
+     "runs a base64-encoded PowerShell command"),
+    (re.compile(r"powershell.*(?:-w\s+hidden|-windowstyle\s+hidden)", re.I),
+     "runs PowerShell with a hidden window"),
+    (re.compile(r"\b(?:wscript|cscript)\b", re.I),
+     "runs a Windows Script Host script"),
+    (re.compile(r"\b(?:curl|certutil|bitsadmin)\b.*\b(?:http|urlcache|transfer)", re.I),
+     "downloads content at logon"),
+]
+
+#: Run keys are the first place to look, so check them all.
+RUN_KEYS = [
+    ("HKCU", r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run"),
+    ("HKCU", r"SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce"),
+    ("HKLM", r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run"),
+    ("HKLM", r"SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce"),
+    ("HKLM", r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run"),
+]
 
 
 def _nonadmin_writable(path: Optional[Path]) -> Optional[bool]:
@@ -170,6 +201,7 @@ class PersistenceScanner(Scanner):
         if not winutil.IS_WINDOWS:
             return
 
+        yield from self._suspicious_autorun_commands(ctx)
         yield from self._defender_exclusions(ctx)
         yield from self._defender_tamper(ctx)
         yield from self._extra_autoruns(ctx)
@@ -177,6 +209,52 @@ class PersistenceScanner(Scanner):
         yield from self._image_hijacks(ctx)
         yield from self._wmi_subscriptions(ctx)
         yield from self._suspicious_services(ctx)
+
+    # ------------------------------------------- suspicious autorun commands
+
+    def _suspicious_autorun_commands(self, ctx: ScanContext) -> Iterable[Issue]:
+        """Autoruns judged by what they DO, not by whether their file exists.
+
+        An entry running `cmd.exe /c start some-domain.click` has a perfectly
+        valid executable, so every path-existence check passes it. What makes
+        it hostile is the shape of the command. This check looks at that.
+        """
+        ctx.report("Checking autorun commands for suspicious patterns", 0.02)
+        for hive_name, subkey in RUN_KEYS:
+            for name, value in _values(hive_name, subkey):
+                command = str(value).strip()
+                if not command:
+                    continue
+                reasons = [why for pattern, why in SUSPICIOUS_COMMAND_PATTERNS
+                           if pattern.search(command)]
+                if not reasons:
+                    continue
+                yield Issue(
+                    category=self.category,
+                    title=f"Suspicious autorun command: {name}",
+                    detail=(
+                        "This runs at every logon and "
+                        + "; it ".join(reasons) + ".\n\n"
+                        f"Name:    {name}\n"
+                        f"Command: {command}\n"
+                        f"Key:     {hive_name}\\{subkey}\n\n"
+                        "Legitimate software starts a program you installed. It "
+                        "does not open web addresses, run encoded commands or "
+                        "download content at logon. This shape is characteristic "
+                        "of adware, browser hijackers and bundled installers.\n\n"
+                        "Do not open the address to find out what it is."
+                    ),
+                    severity=Severity.HIGH,
+                    fix_kind=FixKind.DELETE_REGVALUE,
+                    fix_label="Remove this autorun entry",
+                    requires_admin=(hive_name == "HKLM"),
+                    payload={"hive": hive_name, "subkey": subkey, "value": name},
+                    remediation_hint=(
+                        "The key is exported to .reg before removal, so this is "
+                        "reversible from Tools > Undo. Afterwards run a Defender "
+                        "scan — things that arrive this way rarely arrive alone."
+                    ),
+                )
 
     # ------------------------------------------------- Defender exclusions
 
